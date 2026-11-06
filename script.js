@@ -129,12 +129,29 @@
   const isValidVerb = v =>
     v && ['verb', 'bengaliMeaning', 'englishMeaning', 'example'].every(k => typeof v[k] === 'string' && v[k].trim());
 
-  function showLoading() {
-    dom.status.replaceChildren(el('div', { class: 'spinner' }), el('p', { text: 'Loading phrasal verbs...' }));
+  /* ---------- Skeleton loading ---------- */
+  const SKELETON_COUNT = 6;
+
+  function skeletonCard(i) {
+    return el('article', { class: 'verb-card skeleton-card', 'aria-hidden': 'true', style: `--i:${i}` }, [
+      el('div', { class: 'sk sk-title' }),
+      el('div', { class: 'sk sk-bn' }),
+      el('div', { class: 'sk sk-chip' }),
+      el('div', { class: 'sk sk-example' }),
+    ]);
+  }
+
+  function showSkeleton() {
+    dom.status.replaceChildren();
+    dom.searchMeta.replaceChildren(el('span', { class: 'sk sk-meta' }));
+    dom.grid.setAttribute('aria-busy', 'true');
+    dom.grid.replaceChildren(...Array.from({ length: SKELETON_COUNT }, (_, i) => skeletonCard(i)));
   }
 
   function showLoadError(err) {
     console.error('Failed to load verbs:', err);
+    dom.grid.replaceChildren();
+    dom.grid.removeAttribute('aria-busy');
     const retry = el('button', { class: 'btn btn-secondary', type: 'button', text: 'Try again' });
     retry.addEventListener('click', loadVerbs);
     dom.status.replaceChildren(
@@ -145,20 +162,47 @@
     dom.searchMeta.textContent = '';
   }
 
+  const CACHE_KEY = 'pk_verbs_cache';
+
+  function readCache() {
+    const c = readJSON(CACHE_KEY);
+    return Array.isArray(c) ? c.filter(isValidVerb) : [];
+  }
+
+  function writeCache(list) {
+    try { localStorage.setItem(CACHE_KEY, JSON.stringify(list)); } catch {}
+  }
+
   async function loadVerbs() {
-    showLoading();
-    dom.grid.replaceChildren();
+    // আগে একবার লোড হয়ে থাকলে সেভ করা ডাটা সাথে সাথে দেখাবে, না হলে skeleton
+    const cached = state.verbs.length ? [] : readCache();
+    if (cached.length) {
+      state.verbs = cached;
+      dom.status.replaceChildren();
+      filterVerbs();
+      updateIntro();
+    } else if (!state.verbs.length) {
+      showSkeleton();
+    }
+
     try {
       const res = await fetch(DATA_URL, { cache: 'no-cache' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
       const valid = (Array.isArray(json) ? json : []).filter(isValidVerb);
       if (!valid.length) throw new Error('data.json has no valid entries');
+
+      // ক্যাশ থেকে দেখানো ডাটার সাথে একই হলে আবার render করার দরকার নেই
+      const unchanged = cached.length && JSON.stringify(cached) === JSON.stringify(valid);
       state.verbs = valid;
-      dom.status.replaceChildren();
-      filterVerbs();
+      writeCache(valid);
+      if (!unchanged) {
+        dom.status.replaceChildren();
+        filterVerbs();
+      }
       updateIntro();
     } catch (err) {
+      if (state.verbs.length) { console.warn('Background refresh failed:', err); return; }
       showLoadError(err);
     }
   }
@@ -179,6 +223,7 @@
 
   function renderVerbs(list) {
     dom.grid.replaceChildren();
+    dom.grid.removeAttribute('aria-busy');
     list.forEach((v, i) => {
       const speakerBtn = el('button', {
         class: 'speaker-btn',
