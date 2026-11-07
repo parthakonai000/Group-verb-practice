@@ -6,6 +6,24 @@
   <meta name="theme-color" content="#f5f2ff" />
   <title>Play with Friends | P. K PRACTICE</title>
 
+  <!-- ===== Link preview (WhatsApp, Facebook, Telegram, X ...) =====
+       TODO: put your image link in BOTH "og:image" and "twitter:image" below.
+       Use a full https:// URL (not a relative path). Best size: 1200 x 630 px, ideally under 300 KB. -->
+  <meta name="description" content="Challenge a friend to a live phrasal verb quiz. Create a room, share the code, and see who scores higher." />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="P. K PRACTICE" />
+  <meta property="og:title" content="Play Phrasal Verbs with a Friend | P. K PRACTICE" />
+  <meta property="og:description" content="Challenge a friend to a live phrasal verb quiz. Create a room, share the code, and see who scores higher." />
+  <meta property="og:url" content="https://parthakonai000.github.io/Group-verb-practice/friends.html" />
+  <meta property="og:image" content="https://parthakonai000.github.io/Group-verb-practice/friends.jpg" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="P. K PRACTICE: play phrasal verbs with a friend" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Play Phrasal Verbs with a Friend | P. K PRACTICE" />
+  <meta name="twitter:description" content="Challenge a friend to a live phrasal verb quiz. Create a room, share the code, and see who scores higher." />
+  <meta name="twitter:image" content="https://parthakonai000.github.io/Group-verb-practice/friends.jpg" />
+
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Hind+Siliguri:wght@400;500;600;700&display=swap" rel="stylesheet" />
@@ -447,8 +465,9 @@
             </div>
           </div>
         </div>
+        <button id="btn-next" class="btn primary" type="button">Next round</button>
+        <button id="btn-back" class="btn ghost" type="button">Back to lobby</button>
         <div id="review-wrap"></div>
-        <button id="btn-back" class="btn primary" type="button">Back to lobby</button>
       </section>
     </main>
   </div>
@@ -513,6 +532,7 @@
     flag:   '<path d="M6 21V4M6 5h11l-2.5 4 2.5 4H6"/>',
     rings:  '<circle cx="9" cy="12" r="5"/><circle cx="15" cy="12" r="5"/>',
     link:   '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
+    replay: '<path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4.5V9h-4.5"/>',
     share:  '<circle cx="6" cy="12" r="2.5"/><circle cx="17.5" cy="6" r="2.5"/><circle cx="17.5" cy="18" r="2.5"/><path d="M8.2 10.8l7-3.6M8.2 13.2l7 3.6"/>'
   };
   const icon = (name, size = 18) =>
@@ -658,6 +678,9 @@
   let ready = false;                       // pool loaded + signed in
   let seatKeys = { me: "", opp: "" };
   let lastScores = { me: 0, opp: 0 };
+  let round = 1;                           // round number inside the same pair of friends
+  let moving = false;                      // true while we switch to the next round's room
+  let nextWatchers = [], nextCtx = null;   // listeners that wait for the friend's next-round room
 
   function showState(name) {
     currentState = name;
@@ -717,6 +740,8 @@
     $("btn-cancel").onclick = leaveRoom;
     $("btn-leave").onclick  = () => { if (confirm("Leave this match? Your friend's game will end too.")) leaveRoom(); };
     $("btn-back").onclick   = leaveRoom;
+    $("btn-next").onclick   = startNextRound;
+    paintNextBtn(false);
 
     $("btn-share").innerHTML = icon("link") + "<span>Copy invite link</span>";
     if (navigator.share) {
@@ -775,6 +800,7 @@
       }
       if (taken) throw new Error("no free code");
       await set(ref(db, `Rooms/${code}`), { createdAt: serverTimestamp(), players: { player1: newPlayer() } });
+      try { sessionStorage.removeItem("pk_round_" + code); } catch {}
       enterRoom(code, "player1");
     } catch (err) {
       console.error(err);
@@ -802,6 +828,7 @@
 
       // Take the player2 seat (rules let only the first write succeed)
       await set(ref(db, `Rooms/${code}/players/player2`), { ...newPlayer(), joinedAt: serverTimestamp() });
+      try { sessionStorage.removeItem("pk_round_" + code); } catch {}
       enterRoom(code, "player2");
     } catch (err) {
       console.error(err);
@@ -812,6 +839,7 @@
   function enterRoom(code, role) {
     roomCode = code; myRole = role; gameStarted = false; lastRoom = null;
     seatKeys = { me: "", opp: "" };
+    try { round = Number(sessionStorage.getItem("pk_round_" + code)) || 1; } catch { round = 1; }
     renderRoomCode(code);
     history.replaceState(null, "", `?room=${code}`);
     unsubscribe = onValue(
@@ -847,6 +875,7 @@
 
   function resetToLobby() {
     session++;
+    stopWatchingNext(); moving = false; round = 1;
     if (unsubscribe) { unsubscribe(); unsubscribe = null; }
     roomCode = null; myRole = null; gameStarted = false; lastRoom = null;
     seatKeys = { me: "", opp: "" };
@@ -985,7 +1014,7 @@
     const q = questions[currentQ];
     $("q-area").classList.remove("hidden");
     $("finished-msg").classList.add("hidden");
-    $("q-progress").textContent = `Question ${currentQ + 1} of ${TOTAL}`;
+    $("q-progress").textContent = `${round > 1 ? `Round ${round}, question` : "Question"} ${currentQ + 1} of ${TOTAL}`;
     $("q-text").textContent = q.bn;
     const fb = $("feedback"); fb.textContent = ""; fb.className = "feedback";
 
@@ -1100,6 +1129,8 @@
 
     renderReview();
     showState("result");
+    moving = false; paintNextBtn(false);
+    if (typeof lastRoom?.createdAt === "number") watchNextRound(opp.uid, lastRoom.createdAt, opp.name);
     if (outcome === "win") confetti();
   }
 
@@ -1122,6 +1153,107 @@
       ul.appendChild(li);
     }
     det.appendChild(ul); wrap.appendChild(det);
+  }
+
+  // ---------- 12b. Next round ----------
+  /* One tap moves BOTH friends into a brand-new room.
+     Your Firebase rules don't allow extra fields (like "nextRoom") inside a room, so the new room's
+     code is not sent through the database. Instead both browsers work out the SAME short list of
+     candidate codes from (old room code + old createdAt). Whoever taps first creates the room at the
+     first free candidate; the friend's browser is already listening on all candidates and walks in
+     as player2 automatically. If both tap at the same moment, the rules let only one create it and
+     the other one simply joins it. */
+  function nextCodes(oldCode, oldCreatedAt) {
+    const out = [];
+    for (let k = 0; out.length < 8 && k < 60; k++) {
+      const c = String(1000 + (xmur3(`next:${oldCode}:${oldCreatedAt}:${k}`)() % 9000));
+      if (c !== oldCode && !out.includes(c)) out.push(c);
+    }
+    return out;
+  }
+  // Is this room the one my friend just opened for the next round? (fresh, theirs, waiting for me)
+  function isNextRoomOf(v, oppUid, oldCreatedAt) {
+    const p = v && v.players;
+    return !!(p && p.player1 && p.player1.uid === oppUid && !p.player2 && typeof v.createdAt === "number" && v.createdAt > oldCreatedAt);
+  }
+  function paintNextBtn(busy) {
+    const b = $("btn-next");
+    b.disabled = busy; $("btn-back").disabled = busy;
+    b.innerHTML = icon("replay", 20) + `<span>${busy ? "Starting next round…" : "Next round"}</span>`;
+  }
+  function stopWatchingNext() { nextWatchers.forEach((u) => u()); nextWatchers = []; nextCtx = null; }
+
+  function watchNextRound(oppUid, oldCreatedAt, oppName) {
+    stopWatchingNext();
+    nextCtx = { oppUid, oldCreatedAt, oldCode: roomCode, oppName };
+    for (const c of nextCodes(roomCode, oldCreatedAt)) {
+      nextWatchers.push(onValue(ref(db, `Rooms/${c}`),
+        (snap) => { if (!moving && isNextRoomOf(snap.val(), oppUid, oldCreatedAt)) followFriend(c); },
+        () => {}));
+    }
+  }
+
+  // My friend tapped "Next round" first: take the empty seat in their new room.
+  async function followFriend(code) {
+    if (moving || currentState !== "result" || !nextCtx) return;
+    moving = true; paintNextBtn(true);
+    const name = nextCtx.oppName;
+    try {
+      await set(ref(db, `Rooms/${code}/players/player2`), { ...newPlayer(), joinedAt: serverTimestamp() });
+      toast(`${name} started the next round.`);
+      moveInto(code, "player2");
+    } catch (err) {
+      console.error(err); moving = false; paintNextBtn(false);
+      showError("Could not join the next round. Tap Next round to try again.");
+    }
+  }
+
+  // I tapped "Next round": open the room (or join it if my friend was faster).
+  async function startNextRound() {
+    if (moving || currentState !== "result" || !nextCtx) return;
+    moving = true; paintNextBtn(true);
+    const { oppUid, oldCreatedAt, oldCode } = nextCtx;
+    try {
+      for (const c of nextCodes(oldCode, oldCreatedAt)) {
+        let snap = await get(ref(db, `Rooms/${c}`));
+        if (!snap.exists()) {
+          try {
+            await set(ref(db, `Rooms/${c}`), { createdAt: serverTimestamp(), players: { player1: newPlayer() } });
+            return moveInto(c, "player1");
+          } catch (err) { snap = await get(ref(db, `Rooms/${c}`)); }   // someone got this code first
+        }
+        if (snap.exists() && isNextRoomOf(snap.val(), oppUid, oldCreatedAt)) {
+          await set(ref(db, `Rooms/${c}/players/player2`), { ...newPlayer(), joinedAt: serverTimestamp() });
+          return moveInto(c, "player2");
+        }
+        // otherwise the code belongs to a stranger: try the next candidate
+      }
+      throw new Error("no free code");
+    } catch (err) {
+      console.error(err); moving = false; paintNextBtn(false);
+      showError("Could not start the next round. Please try again.");
+    }
+  }
+
+  function moveInto(code, role) {
+    const oldCode = roomCode, oldRole = myRole, nextRound = round + 1;
+    stopWatchingNext();
+    if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+    session++;                                          // cancel timers of the finished match
+    answers = []; questions = []; currentQ = 0; myScore = 0;
+    locked = false; pendingFeedback = false; lastScores = { me: 0, opp: 0 };
+    try { sessionStorage.setItem("pk_round_" + code, String(nextRound)); } catch {}
+    // The old host tidies up the finished room a few seconds later (friend may still be reading it)
+    if (oldRole === "player1" && oldCode) setTimeout(() => remove(ref(db, `Rooms/${oldCode}`)).catch(() => {}), 8000);
+    moving = false; paintNextBtn(false);
+
+    // Leave the result screen right away (renderRoom ignores updates while on "result")
+    showState("waiting");
+    $("seat-me").replaceChildren(); $("seat-opp").replaceChildren();
+    $("share-row").classList.add("hidden"); $("countdown").classList.add("hidden");
+    $("room-status").classList.remove("hidden"); $("room-status").textContent = "Opening the next round…";
+    $("btn-cancel").textContent = "Leave room";
+    enterRoom(code, role);
   }
 
   // ---------- 13. Confetti (winner only, skipped for reduced motion) ----------
@@ -1151,7 +1283,7 @@
   }
 
   // Exposed only so buildQuestions can be unit-tested from the console / a test page
-  window.__pk = { buildQuestions, xmur3, mulberry32 };
+  window.__pk = { buildQuestions, xmur3, mulberry32, nextCodes };
 
   init();
   </script>
