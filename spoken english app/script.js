@@ -14,9 +14,9 @@ const norm = t => t.toLowerCase().replace(/[^a-z0-9' ]/g, ' ').split(/\s+/).filt
 const clean = w => norm(w)[0] || '';
 
 const LV = ['Beginner', 'Elementary', 'Intermediate'];
-const LEVEL_SIZE = 15;
-const BN_SPEED = 1; // Bengali voice speed: 1 = normal, 0.8 = slower, 1.2 = faster
-const GURL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=';
+const UNIQUE_PER_LEVEL = 5;          // প্রতি লেভেলে ৫টি ইউনিক বাক্য
+const LEVEL_SIZE = UNIQUE_PER_LEVEL * 3; // ৫টি বাক্য × ৩ ধাপ = ১৫ টার্ন
+const BN_SPEED = 1;                  // Bengali voice speed: 1 = normal, 0.8 = slower, 1.2 = faster
 
 const LEVELS = [
   { num: 1, title: 'Everyday basics', topic: 'Self-Introduction', level: 'Beginner' },
@@ -55,7 +55,7 @@ let rec = null, gen = false, testRes = [], round = { ok: 0 };
 let passedCurrent = false;
 let autoNextTimer = null;
 let autoMic = L.getItem('auto_mic') !== '0', micBlocked = false, manualStop = false, tries = 0, idleTries = 0;
-let speakToken = 0, bnAudio = null, speakRef = null, bnWarned = false;
+let speakToken = 0, bnAudio = null, speakRef = null;
 let actx = null, bnSrc = null;
 const bnCache = new Map();
 let currentTipWord = null, currentNwObj = null;
@@ -76,6 +76,23 @@ function getUnlockedLevel() {
   return Math.max(1, localLv, dbLv);
 }
 function setUnlockedLevel(n) { L.setItem('unlocked_level', String(n)); }
+
+/* ===== Progressive 3-Stage Queue Builder ===== */
+function buildProgressiveQueue(sentences) {
+  const base = sentences.slice(0, UNIQUE_PER_LEVEL);
+  const stage0 = base.map(s => ({ ...s, _stage: 0 })); // ধাপ ১: পুরো বাক্য দেখাবে
+  const stage1 = base.map(s => ({ ...s, _stage: 1 })); // ধাপ ২: মাঝের ১-২টি শব্দ লুকানো
+  const stage2 = base.map(s => ({ ...s, _stage: 2 })); // ধাপ ৩: সব লুকানো, শুধু বাংলা দেখে বলা
+  return [...stage0, ...stage1, ...stage2];
+}
+
+function getMiddleHidden(s) {
+  const given = (s.hidden || []).map(h => clean(h)).filter(Boolean);
+  if (given.length) return given;
+  const words = s.en.split(' ').map(clean).filter(w => w.length >= 4);
+  if (words.length >= 2) return [words[Math.floor(words.length / 3)], words[Math.floor((words.length * 2) / 3)]];
+  return words.slice(0, 1);
+}
 
 /* ===== Saved Words (LocalStorage) ===== */
 function isSaved(word) {
@@ -104,7 +121,7 @@ function toast(t) {
   e.textContent = t;
   e.hidden = false;
   clearTimeout(toast.t);
-  toast.t = setTimeout(() => { e.hidden = true; }, 2600);
+  toast.t = setTimeout(() => { e.hidden = true; }, 3000);
 }
 
 function setStatus(main, sub, cls = '') {
@@ -116,7 +133,7 @@ function setStatus(main, sub, cls = '') {
 
 function updateUI() {
   const unlocked = getUnlockedLevel();
-  const currentDef = LEVELS[Math.min(unlocked - 1, LEVELS.length - 1)] || { num: unlocked, title: 'Practice stage' };
+  const currentDef = getLevelDef(unlocked);
   $('#currentLevelLabel').textContent = `Level ${unlocked} · ${currentDef.title}`;
   if (P) {
     $('#sScore').textContent = P.score;
@@ -151,7 +168,7 @@ function renderLevelMap() {
     const isDone = lv.num < unlocked;
     const isActive = lv.num === unlocked;
     const cls = isDone ? 'done' : isActive ? 'active' : 'locked';
-    const sub = isDone ? 'Completed · 15 sentences' : isActive ? 'Ready to practice · 15 sentences' : 'Complete previous level to unlock';
+    const sub = isDone ? 'Completed · 3-step mastery' : isActive ? 'Ready · 5 sentences × 3 steps' : 'Complete previous level to unlock';
     const icon = isDone ? SVG.check : isActive ? SVG.play : SVG.lock;
 
     html += `
@@ -255,7 +272,7 @@ function getCtx() {
 async function geminiBn(text) {
   if (bnCache.has(text)) return bnCache.get(text);
   let err = 'no audio returned';
-  for (const m of ['gemini-3.1-flash-tts-preview', 'gemini-2.5-flash-preview-tts']) {
+  for (const m of ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts', 'gemini-3.1-flash-tts-preview']) {
     const ac = new AbortController();
     const t = setTimeout(() => ac.abort(), 12000);
     try {
@@ -469,7 +486,7 @@ async function startLevel(lvlNum) {
 
   activeLevelNum = lvlNum;
   mode = 'level';
-  const def = LEVELS[Math.min(lvlNum - 1, LEVELS.length - 1)] || { num: lvlNum, title: 'Exercises', topic: null, level: P.level || 'Beginner' };
+  const def = getLevelDef(lvlNum);
 
   openPracticeView();
   $('#pTitle').textContent = `Level ${lvlNum} · ${def.title}`;
@@ -478,17 +495,28 @@ async function startLevel(lvlNum) {
   $('#pCard').hidden = true;
 
   try {
-    const { data, error } = await sb.from('sentences').select('*').limit(300);
+    let { data, error } = await sb.from('sentences').select('*').limit(300);
     if (error) throw error;
     if (!data || !data.length) { closePracticeView(); return toast('No sentences found'); }
 
-    const unseen = data.filter(s => !seenIds.has(s.id));
-    const seen = data.filter(s => seenIds.has(s.id));
+    let unseen = data.filter(s => !seenIds.has(s.id));
 
+    if (unseen.length < UNIQUE_PER_LEVEL && cfg('gk')) {
+      toast('Creating new sentences for this level...');
+      await genBackground();
+      const res = await sb.from('sentences').select('*').limit(300);
+      if (res.data) {
+        data = res.data;
+        unseen = data.filter(s => !seenIds.has(s.id));
+      }
+    }
+
+    const seen = data.filter(s => seenIds.has(s.id));
     let primary = def.topic ? unseen.filter(s => s.topic === def.topic) : unseen.filter(s => s.level === def.level);
     let otherUnseen = unseen.filter(s => !primary.includes(s));
-    Q = [...shuf(primary), ...shuf(otherUnseen), ...shuf(seen)].slice(0, LEVEL_SIZE);
+    const picked = [...shuf(primary), ...shuf(otherUnseen), ...shuf(seen)].slice(0, UNIQUE_PER_LEVEL);
 
+    Q = buildProgressiveQueue(picked);
     i = 0; round = { ok: 0 };
     renderQuestion();
   } catch (e) {
@@ -507,9 +535,9 @@ async function startTopicPractice(topicName) {
 
   const { data, error } = await sb.from('sentences').select('*').eq('topic', topicName).limit(100);
   if (error) { closePracticeView(); return toast(error.message); }
-  Q = shuf(data).slice(0, LEVEL_SIZE);
+  if (!data.length) { closePracticeView(); return toast('No sentences in this topic'); }
+  Q = buildProgressiveQueue(shuf(data));
   i = 0; round = { ok: 0 };
-  if (!Q.length) { closePracticeView(); return toast('No sentences in this topic'); }
   renderQuestion();
 }
 
@@ -523,15 +551,16 @@ async function startMistakePractice() {
 
   const { data, error } = await sb.from('mistakes').select('sentences(*)');
   if (error) { closePracticeView(); return toast(error.message); }
-  Q = shuf(data.map(r => r.sentences).filter(Boolean)).slice(0, LEVEL_SIZE);
+  const rows = shuf(data.map(r => r.sentences).filter(Boolean));
+  if (!rows.length) { closePracticeView(); return toast('No mistakes to revise'); }
+  Q = buildProgressiveQueue(rows);
   i = 0; round = { ok: 0 };
-  if (!Q.length) { closePracticeView(); return toast('No mistakes to revise'); }
   renderQuestion();
 }
 
 function startTest() {
   mode = 'test'; testRes = [];
-  Q = TEST.map(t => ({ ...t, hidden: [], words: [] }));
+  Q = TEST.map(t => ({ ...t, hidden: [], words: [], _stage: 0 }));
   i = 0; round = { ok: 0 };
   openPracticeView();
   $('#pTitle').textContent = 'Level assessment';
@@ -542,6 +571,7 @@ function startTest() {
 function renderQuestion() {
   clearTimeout(autoNextTimer);
   const s = Q[i];
+  const stage = s._stage ?? 0; // 0 = full, 1 = blanks, 2 = all hidden
   passedCurrent = false;
   tries = 0; idleTries = 0;
 
@@ -559,13 +589,22 @@ function renderQuestion() {
   $('#micLbl').textContent = 'Start';
 
   renderDots();
-  setStatus('Ready', 'Tap Start to speak');
+
+  if (mode === 'test') {
+    setStatus('Ready', 'Tap Start to speak');
+  } else if (stage === 0) {
+    setStatus('Step 1 of 3 · Read & Speak', 'Read the full English sentence clearly');
+  } else if (stage === 1) {
+    setStatus('Step 2 of 3 · Fill the Blanks', 'Speak the full sentence including missing words');
+  } else {
+    setStatus('Step 3 of 3 · Full Recall', 'Translate from Bengali and speak in English');
+  }
 
   const wordsArr = Array.isArray(s.words) ? s.words : [];
-  const hidLower = (s.hidden || []).map(h => h.toLowerCase());
+  const hidLower = stage === 1 ? getMiddleHidden(s) : [];
   const spotlight = wordsArr.find(x => hidLower.includes(clean(x.w))) || wordsArr[0];
 
-  if (spotlight && mode !== 'test') {
+  if (spotlight && mode !== 'test' && stage < 2) {
     currentNwObj = { w: spotlight.w, bn: spotlight.bn, pr: spotlight.pr, ex: s.en };
     $('#nwWord').textContent = spotlight.w;
     $('#nwPron').textContent = spotlight.pr ? `(${spotlight.pr})` : '';
@@ -580,16 +619,18 @@ function renderQuestion() {
     $('#newWordBox').hidden = true;
   }
 
+  // Render English Sentence based on stage (0 = full, 1 = partial blanks, 2 = all blanks)
   const en = $('#en');
   en.innerHTML = '';
   s.en.split(' ').forEach(w => {
     const k = clean(w);
     const sp = document.createElement('span');
-    if (hidLower.includes(k)) {
+    const hideThis = (stage === 2 && k.length > 0) || (stage === 1 && hidLower.includes(k));
+    if (hideThis) {
       sp.className = 'blank';
       sp.dataset.k = k;
       sp.dataset.p = w.replace(/^[A-Za-z']+/, '');
-      sp.textContent = '_'.repeat(k.length) + sp.dataset.p;
+      sp.textContent = '_'.repeat(Math.min(k.length, 6)) + sp.dataset.p;
     } else {
       sp.className = 'w';
       sp.textContent = w;
@@ -618,7 +659,9 @@ const same = (a, b) => a === b || (a.length >= 5 && b.length >= 5 && lev(a, b) <
 
 function checkSpeech(txt) {
   const s = Q[i];
-  const sw = norm(txt), hid = (s.hidden || []).map(h => h.toLowerCase());
+  const stage = s._stage ?? 0;
+  const sw = norm(txt);
+  const hid = stage === 1 ? getMiddleHidden(s) : [];
   let ok = 0, pos = 0, missedHidden = false;
 
   const spans = s.en.split(' ').map(w => {
@@ -656,9 +699,9 @@ function checkSpeech(txt) {
     if (tries === 0) round.first = (round.first || 0) + 1;
     const dot = $$('.p-dot')[i]; if (dot) dot.className = 'p-dot done';
     award();
-    markSeen(s.id);
+    if (stage === 2) markSeen(s.id); // ৩য় ধাপ শেষ হলেই বাক্যটি শেখা হয়ে গেছে হিসেবে মার্ক হবে
     $('#bNext').disabled = false;
-    if (mode === 'mistake' && s.id) {
+    if (mode === 'mistake' && stage === 2 && s.id) {
       sb.from('mistakes').delete().eq('sentence_id', s.id).then(() => {});
     }
     autoNextTimer = setTimeout(advance, 1200);
@@ -731,15 +774,47 @@ function finishRound() {
   genBackground();
 }
 
-/* ===== Tap-to-Meaning + Save Popover ===== */
+/* ===== Tap-to-Meaning + Example Sentences Popover ===== */
+function ensureTipExBox() {
+  let box = $('#tipEx');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'tipEx';
+    box.style.cssText = 'margin-top:8px;padding-top:8px;border-top:1px solid rgba(128,128,128,0.22);font-size:12.5px;line-height:1.45;';
+    $('#tip').appendChild(box);
+  }
+  return box;
+}
+
+function renderTipExamples(box, exList) {
+  if (!Array.isArray(exList) || !exList.length) {
+    box.innerHTML = '';
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  box.innerHTML = `<div style="font-size:11px;opacity:.65;margin-bottom:4px;font-weight:600;">Examples (tap to listen):</div>` +
+    exList.slice(0, 2).map(x => `
+      <div class="tip-ex-item" data-ex-en="${esc(x.en)}" style="margin-bottom:6px;cursor:pointer;">
+        <div style="font-weight:500;">• ${esc(x.en)}</div>
+        <div style="opacity:.78;font-size:12px;">${esc(x.bn || '')}</div>
+      </div>
+    `).join('');
+  box.querySelectorAll('.tip-ex-item').forEach(item => {
+    item.onclick = e => { e.stopPropagation(); speakEn(item.dataset.exEn, 0.95); };
+  });
+}
+
 async function showWordTip(el, rawWord) {
   const s = Q[i];
   const k = clean(rawWord);
   if (!k) return;
 
   const tip = $('#tip');
+  const exBox = ensureTipExBox();
   const rect = el.getBoundingClientRect();
-  let m = (s.words || []).find(x => clean(x.w) === k) || wordCache[k];
+  let cached = wordCache[k];
+  let m = cached || (s.words || []).find(x => clean(x.w) === k);
 
   currentTipWord = { w: k, bn: m ? m.bn : '', pr: m ? m.pr : '', ex: s.en };
 
@@ -751,41 +826,86 @@ async function showWordTip(el, rawWord) {
   $('#bTipSave').classList.toggle('saved', saved);
   $('#tipSaveTxt').textContent = saved ? 'Saved' : 'Save';
 
+  if (cached && Array.isArray(cached.ex) && cached.ex.length) {
+    renderTipExamples(exBox, cached.ex);
+  } else if (cfg('gk')) {
+    exBox.hidden = false;
+    exBox.innerHTML = '<div style="font-size:12px;opacity:.65;">Loading usage examples...</div>';
+  } else {
+    exBox.hidden = true;
+  }
+
   tip.hidden = false;
-  const left = Math.max(12, Math.min(rect.left, window.innerWidth - 260));
-  const top = rect.bottom + 8 + 100 > window.innerHeight ? rect.top - 96 : rect.bottom + 8;
+  const left = Math.max(12, Math.min(rect.left, window.innerWidth - 270));
+  const top = rect.bottom + 180 > window.innerHeight ? Math.max(12, rect.top - 175) : rect.bottom + 8;
   tip.style.left = left + 'px';
   tip.style.top = top + 'px';
 
-  if (!m && cfg('gk')) {
+  if ((!cached || !Array.isArray(cached.ex) || !cached.ex.length) && cfg('gk')) {
     try {
-      m = await gem(`Give the Bengali meaning and Bengali-script pronunciation of the English word "${k}". Return JSON only: {"bn":"","pr":""}`);
-      wordCache[k] = m;
+      const res = await gem(`Give the Bengali meaning, Bengali-script pronunciation, and 2 short practical daily-use example sentences (with natural Bengali meaning) for the English word "${k}". Return JSON only: {"bn":"","pr":"","ex":[{"en":"","bn":""},{"en":"","bn":""}]}`);
+      wordCache[k] = {
+        bn: res.bn || (m && m.bn) || '',
+        pr: res.pr || (m && m.pr) || '',
+        ex: Array.isArray(res.ex) ? res.ex : []
+      };
       L.setItem('wc', JSON.stringify(wordCache));
       if (currentTipWord && currentTipWord.w === k) {
-        currentTipWord.bn = m.bn || '';
-        currentTipWord.pr = m.pr || '';
-        $('#tipPron').textContent = m.pr || '';
-        $('#tipBn').textContent = m.bn || 'Meaning not found';
+        currentTipWord.bn = wordCache[k].bn;
+        currentTipWord.pr = wordCache[k].pr;
+        $('#tipPron').textContent = wordCache[k].pr || '';
+        $('#tipBn').textContent = wordCache[k].bn || 'Meaning not found';
+        renderTipExamples(exBox, wordCache[k].ex);
       }
     } catch (e) {
-      $('#tipBn').textContent = 'Could not fetch meaning';
+      if (!m) $('#tipBn').textContent = 'Could not fetch meaning';
+      exBox.hidden = true;
     }
   }
 }
 
-/* ===== Background Gemini Generator ===== */
+/* ===== Background Gemini Generator (Auto-Fallback) ===== */
 async function gem(p) {
-  const r = await fetch(GURL + cfg('gk'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: p }] }],
-      generationConfig: { responseMimeType: 'application/json', temperature: 0.8 }
-    })
-  });
-  const j = await r.json();
-  return JSON.parse(j.candidates[0].content.parts[0].text.replace(/```json|```/g, '').trim());
+  const models = [
+    'gemini-3.5-flash-lite',
+    'gemini-3.1-flash-lite',
+    'gemini-3.6-flash',
+    'gemini-3.8-flash'
+  ];
+  let lastErr = 'Gemini থেকে কোনো উত্তর আসেনি';
+
+  for (const m of models) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${cfg('gk')}`;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const r = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: p }] }],
+            generationConfig: { responseMimeType: 'application/json', temperature: 0.8 }
+          })
+        });
+        const j = await r.json();
+
+        if (!j.error) {
+          const txt = j.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (!txt) throw new Error('Empty response');
+          return JSON.parse(txt.replace(/```json|```/g, '').trim());
+        }
+
+        lastErr = `${m}: ${j.error.message}`;
+        if (r.status === 503 || /high demand|overloaded|temporarily/i.test(j.error.message)) {
+          await wait(1200);
+          continue;
+        }
+        break;
+      } catch (e) {
+        lastErr = `${m}: ${e.message}`;
+      }
+    }
+  }
+  throw new Error(lastErr);
 }
 
 async function genBackground() {
@@ -794,39 +914,57 @@ async function genBackground() {
   try {
     const [{ data: m }, { data: existing }] = await Promise.all([
       sb.from('mistakes').select('sentences(en,topic)').limit(10),
-      sb.from('sentences').select('en').order('id', { ascending: false }).limit(40)
+      sb.from('sentences').select('en').order('id', { ascending: false }).limit(50)
     ]);
 
     const weak = (m || []).map(r => r.sentences).filter(Boolean);
     const avoidList = (existing || []).map(r => r.en);
+    const avoidSet = new Set(avoidList.map(x => x.trim().toLowerCase()));
 
-    let difficultyGuide = 'Keep sentences natural, medium-level everyday spoken English (7 to 11 words). Avoid overly academic or bookish words.';
-    if (P.recent_acc >= 80) {
-      difficultyGuide = 'The learner did well! Make these sentences slightly longer and more challenging (10 to 14 words) using everyday phrasal verbs, connectors (because, although, unless), and natural expressions, but still practical for daily conversation.';
-    } else if (P.recent_acc < 60) {
-      difficultyGuide = 'Keep sentences slightly simpler and clearer (6 to 9 words) so the learner can speak comfortably.';
+    const curLevel = (P && P.level) || 'Beginner';
+    const recentAcc = (P && P.recent_acc) || 0;
+
+    let difficultyGuide = 'Target a Bengali Class 11 student who already speaks basic English and wants to build strong daily communication skills. Keep most sentences 7 to 12 words (maximum 15 words). Focus on practical sentence structures, 1-2 useful everyday vocabulary words per sentence, and natural basic clauses (using connectors like because, when, if, that, who, although). Avoid overly academic or bookish words.';
+    if (recentAcc >= 85) {
+      difficultyGuide = 'The learner is doing well! Keep sentences 9 to 14 words (max 15 words). Include natural everyday clauses (although, unless, whenever, which, so that) and useful intermediate vocabulary for real-life conversations, without sounding too formal or bookish.';
+    } else if (recentAcc < 60) {
+      difficultyGuide = 'Keep sentences clear and comfortable to speak (6 to 9 words). Focus on practical daily-use sentence structures and simple clauses (because, when, if).';
     }
 
-    const arr = await gem(`You are a friendly Spoken English coach for a Bengali speaker who can speak basic English and wants to become fluent in daily conversation.
-Current level: ${P.level}. Completed rounds: ${P.round_count || 0}. Last round accuracy: ${P.recent_acc}%.
-Instruction: ${difficultyGuide}
+    const res = await gem(`You are a friendly Spoken English coach for a Bengali Class 11 student who knows basic English and wants to improve communication skills, vocabulary, and grammar/sentence structure.
+Last round accuracy: ${recentAcc}%.
+DIFFICULTY & STYLE RULE: ${difficultyGuide}
 Recently missed sentences to practice subtly: ${JSON.stringify(weak)}.
 STRICT RULE: Do NOT repeat or closely paraphrase any of these existing sentences: ${JSON.stringify(avoidList)}.
-Create 15 NEW, unique, practical daily-use spoken English sentences. Use ONLY English and Bengali, never Hindi.
-Return ONLY a JSON array of 15 items. Each item: {"en":"sentence","bn":"natural Bengali meaning","hidden":["1-2 useful words from en, lowercase, no punctuation"],"topic":"Self-Introduction|Talking to Friends|Asking Questions|Shopping|Daily Conversations","level":"${P.level}","words":[{"w":"important word from en, lowercase","bn":"Bengali meaning","pr":"Bengali-script pronunciation"}]}`);
+Create 15 NEW, natural, practical daily-use spoken English sentences. Use ONLY English and Bengali, never Hindi.
+Return ONLY a JSON array of 15 items. Each item: {"en":"sentence","bn":"natural Bengali meaning","hidden":["1-2 useful words from en, lowercase, no punctuation"],"topic":"Self-Introduction|Talking to Friends|Asking Questions|Shopping|Daily Conversations","level":"${curLevel}","words":[{"w":"useful new word from en, lowercase","bn":"Bengali meaning","pr":"Bengali-script pronunciation"}]}`);
 
-    const rows = arr.filter(x => x.en && x.bn && Array.isArray(x.hidden)).slice(0, 15).map(x => ({
-      en: x.en,
-      bn: x.bn,
-      hidden: x.hidden.map(h => String(h).toLowerCase()),
-      topic: x.topic || 'Daily Conversations',
-      level: LV.includes(x.level) ? x.level : P.level,
-      words: x.words || []
-    }));
+    const arr = Array.isArray(res) ? res : (Array.isArray(res?.sentences) ? res.sentences : []);
+    const rows = arr
+      .filter(x => x && x.en && x.bn && !avoidSet.has(String(x.en).trim().toLowerCase()))
+      .slice(0, 15)
+      .map(x => ({
+        en: String(x.en).trim(),
+        bn: String(x.bn).trim(),
+        hidden: Array.isArray(x.hidden) ? x.hidden.map(h => String(h).toLowerCase()) : [],
+        topic: x.topic || 'Daily Conversations',
+        level: LV.includes(x.level) ? x.level : curLevel,
+        words: Array.isArray(x.words) ? x.words : []
+      }));
 
-    if (rows.length) await sb.from('sentences').upsert(rows, { onConflict: 'en', ignoreDuplicates: true });
+    if (!rows.length) throw new Error('No valid new sentences returned');
+
+    let { error } = await sb.from('sentences').upsert(rows, { onConflict: 'en', ignoreDuplicates: true });
+    if (error && /unique|constraint|conflict/i.test(error.message)) {
+      const ins = await sb.from('sentences').insert(rows);
+      error = ins.error;
+    }
+    if (error) throw new Error('Supabase: ' + error.message);
+
+    toast(`${rows.length} new sentences added`);
   } catch (e) {
     console.warn('Background generation failed', e);
+    toast('Error: ' + (e.message || 'Check Gemini key'));
   } finally {
     gen = false;
   }
@@ -935,7 +1073,7 @@ $('#bHint').onclick = () => {
   const s = Q[i]; if (!s) return;
   $$('.blank').forEach(b => {
     const k = b.dataset.k;
-    b.textContent = k[0] + '_'.repeat(Math.max(0, k.length - 1)) + b.dataset.p;
+    b.textContent = k[0] + '_'.repeat(Math.max(0, Math.min(k.length - 1, 5))) + b.dataset.p;
   });
   const clue = (s.words || []).filter(x => (s.hidden || []).includes(clean(x.w))).map(x => x.bn).join(', ');
   setStatus('Hint', clue || 'First letters revealed');
