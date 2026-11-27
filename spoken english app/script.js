@@ -280,7 +280,7 @@ async function geminiBn(text) {
         method: 'POST', signal: ac.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          contents: [{ parts: [{ text: 'Say at a normal, natural speaking pace: ' + text }] }],
+          contents: [{ parts: [{ text: text }] }],
           generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } } }
         })
       });
